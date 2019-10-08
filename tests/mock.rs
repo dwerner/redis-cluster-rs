@@ -29,7 +29,7 @@ pub struct MockConnection {
 }
 
 impl Connect for MockConnection {
-    fn connect<T>(info: T) -> RedisFuture<Self>
+    fn connect<T>(info: T) -> RedisFuture<'static, Self>
     where
         T: IntoConnectionInfo,
     {
@@ -39,7 +39,7 @@ impl Connect for MockConnection {
             redis::ConnectionAddr::Tcp(addr, port) => (addr, *port),
             _ => unreachable!(),
         };
-        Box::new(future::ok(MockConnection {
+        Box::pin(future::ok(MockConnection {
             handler: HANDLERS
                 .read()
                 .unwrap()
@@ -78,21 +78,19 @@ fn respond_startup(name: &str, cmd: &[u8]) -> Result<(), RedisResult<Value>> {
 }
 
 impl ConnectionLike for MockConnection {
-    fn req_packed_command(self, cmd: Vec<u8>) -> RedisFuture<(Self, Value)> {
-        Box::new(future::result(
-            (self.handler)(&cmd, self.port)
-                .expect_err("Handler did not specify a response")
-                .map(|value| (self, value)),
+    fn req_packed_command(&mut self, cmd: Vec<u8>) -> RedisFuture<'_, Value> {
+        Box::pin(future::ready(
+            (self.handler)(&cmd, self.port).expect_err("Handler did not specify a response"),
         ))
     }
 
     fn req_packed_commands(
-        self,
+        &mut self,
         _cmd: Vec<u8>,
         _offset: usize,
         _count: usize,
-    ) -> RedisFuture<(Self, Vec<Value>)> {
-        Box::new(future::ok((self, vec![])))
+    ) -> RedisFuture<'_, Vec<Value>> {
+        Box::pin(future::ok(vec![]))
     }
 
     fn get_db(&self) -> i64 {
@@ -148,7 +146,7 @@ fn tryagain_simple() {
     let requests = atomic::AtomicUsize::new(0);
     let MockEnv {
         mut runtime,
-        connection,
+        mut connection,
         handler: _handler,
         ..
     } = MockEnv::new(name, move |cmd: &[u8], _| {
@@ -160,13 +158,11 @@ fn tryagain_simple() {
         }
     });
 
-    let value = runtime
-        .block_on(
-            cmd("GET")
-                .arg("test")
-                .query_async::<_, Option<i32>>(connection),
-        )
-        .map(|(_, x)| x);
+    let value = runtime.block_on(
+        cmd("GET")
+            .arg("test")
+            .query_async::<_, Option<i32>>(&mut connection),
+    );
 
     assert_eq!(value, Ok(Some(123)));
 }
@@ -192,7 +188,7 @@ fn tryagain_exhaust_retries() {
         }
     });
 
-    let connection = runtime
+    let mut connection = runtime
         .block_on(
             client
                 .set_retries(Some(2))
@@ -200,13 +196,11 @@ fn tryagain_exhaust_retries() {
         )
         .unwrap();
 
-    let result = runtime
-        .block_on(
-            cmd("GET")
-                .arg("test")
-                .query_async::<_, Option<i32>>(connection),
-        )
-        .map(|(_, x)| x);
+    let result = runtime.block_on(
+        cmd("GET")
+            .arg("test")
+            .query_async::<_, Option<i32>>(&mut connection),
+    );
 
     assert_eq!(
         result.map_err(|err| err.to_string()),
@@ -224,7 +218,7 @@ fn rebuild_with_extra_nodes() {
     let started = atomic::AtomicBool::new(false);
     let MockEnv {
         mut runtime,
-        connection,
+        mut connection,
         handler: _handler,
         ..
     } = MockEnv::new(name, move |cmd: &[u8], port| {
@@ -271,13 +265,11 @@ fn rebuild_with_extra_nodes() {
         }
     });
 
-    let value = runtime
-        .block_on(
-            cmd("GET")
-                .arg("test")
-                .query_async::<_, Option<i32>>(connection),
-        )
-        .map(|(_, x)| x);
+    let value = runtime.block_on(
+        cmd("GET")
+            .arg("test")
+            .query_async::<_, Option<i32>>(&mut connection),
+    );
 
     assert_eq!(value, Ok(Some(123)));
 }
