@@ -13,11 +13,12 @@ edition = "2018"
 
 [dependencies]
 crc16 = "0.4"
-futures = "0.1"
+futures = { version = "0.3.0-alpha.18", package = "futures-preview" }
 rand = "0.7"
-redis = "0.11"
-tokio-executor = "0.1"
-tokio-timer = "0.2"
+pin-project = "0.4"
+redis = { path = "../redis-rs", features = ["executor"] } 
+tokio-executor = "0.2.0-alpha.6"
+tokio-timer = "0.3.0-alpha.6"
 log = "0.4"
 
 [dev-dependencies]
