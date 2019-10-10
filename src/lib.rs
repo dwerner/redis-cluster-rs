@@ -319,31 +319,24 @@ impl<C> Pipeline<C>
 where
     C: ConnectionLike + Connect + Clone + Send + 'static,
 {
-    fn new(initial_nodes: Vec<ConnectionInfo>, retries: Option<u32>) -> impl ImplRedisFuture<Self> {
-        Self::create_initial_connections(&initial_nodes).and_then(move |connections| {
-            let mut connection = Some(Pipeline {
-                connections,
-                slots: Default::default(),
-                in_flight_requests: Vec::new(),
-                state: ConnectionState::PollComplete,
-                retries,
-            });
-            let mut refresh_slots_future = connection.as_mut().unwrap().refresh_slots().boxed();
-            future::poll_fn(move |cx| {
-                let (slots, connections) = ready!(Pin::new(&mut refresh_slots_future).poll(cx))?;
-                let mut connection = connection.take().unwrap();
-                connection.slots = slots;
-                connection.connections = connections;
-                Ok(connection.into()).into()
-            })
-        })
+    async fn new(initial_nodes: Vec<ConnectionInfo>, retries: Option<u32>) -> RedisResult<Self> {
+        let connections = Self::create_initial_connections(&initial_nodes).await?;
+        let mut connection = Pipeline {
+            connections,
+            slots: Default::default(),
+            in_flight_requests: Vec::new(),
+            state: ConnectionState::PollComplete,
+            retries,
+        };
+        let (slots, connections) = connection.refresh_slots().await?;
+        connection.slots = slots;
+        connection.connections = connections;
+        Ok(connection)
     }
 
     fn create_initial_connections(
         initial_nodes: &Vec<ConnectionInfo>,
     ) -> impl ImplRedisFuture<HashMap<String, C>> {
-        let connections = HashMap::with_capacity(initial_nodes.len());
-
         stream::iter(initial_nodes.clone())
             .then(|info| {
                 let addr = match *info.addr {
@@ -357,7 +350,7 @@ where
                 })
             })
             .fold(
-                connections,
+                HashMap::with_capacity(initial_nodes.len()),
                 |mut connections: HashMap<String, C>, conn: Option<(String, C)>| {
                     async move {
                         connections.extend(conn);

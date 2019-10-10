@@ -57,10 +57,8 @@ impl RedisEnv {
         let node_infos = loop {
             let node_infos = runtime
                 .block_on(async {
-                    let mut conn = redis_client
-                        .get_shared_async_connection().await?;
-                    Self::cluster_info(&mut conn)
-                        .await
+                    let mut conn = redis_client.get_shared_async_connection().await?;
+                    Self::cluster_info(&mut conn).await
                 })
                 .expect("Unable to query nodes for information");
             // Wait for the cluster to stabilize
@@ -93,9 +91,7 @@ impl RedisEnv {
         }
 
         let client = runtime
-            .block_on(async {
-                Client::open(node_urls.iter().map(|s| &s[..]).collect())
-            })
+            .block_on(async { Client::open(node_urls.iter().map(|s| &s[..]).collect()) })
             .unwrap();
 
         RedisEnv {
@@ -106,9 +102,7 @@ impl RedisEnv {
         }
     }
 
-    async fn cluster_info<T>(
-        redis_client: &mut T,
-    ) -> RedisResult<Vec<(String, bool)>>
+    async fn cluster_info<T>(redis_client: &mut T) -> RedisResult<Vec<(String, bool)>>
     where
         T: Clone + redis::aio::ConnectionLike + Send + 'static,
     {
@@ -148,7 +142,8 @@ fn basic_cmd() {
             let () = cmd("SET")
                 .arg("test")
                 .arg("test_data")
-                .query_async(&mut connection).await?;
+                .query_async(&mut connection)
+                .await?;
             let res: String = cmd("GET")
                 .arg("test")
                 .clone()
@@ -232,10 +227,7 @@ fn test_failover(env: &mut FailoverEnv, requests: i32, value: i32) {
     let completed = Cell::new(0);
     let completed = &completed;
 
-    let FailoverEnv {
-        env,
-        connection,
-    } = env;
+    let FailoverEnv { env, connection } = env;
 
     let nodes = env.nodes.clone();
 
