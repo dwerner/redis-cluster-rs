@@ -85,7 +85,7 @@ impl RedisEnv {
 
             nodes.push(
                 runtime
-                    .block_on(redis_client.get_shared_async_connection())
+                    .block_on(async { redis_client.get_shared_async_connection().await })
                     .unwrap(),
             );
         }

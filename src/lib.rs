@@ -44,7 +44,7 @@
 //!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
 //!
 //!     let mut runtime = Runtime::new().unwrap();
-//!     runtime.block_on(future::lazy(|| {
+//!     runtime.block_on(async move {
 //!         let client = Client::open(nodes).unwrap();
 //!         client.get_connection().and_then(|connection| {
 //!             let key = "test2";
@@ -54,9 +54,9 @@
 //!                 .ltrim(key, -10, -1).ignore()
 //!                 .expire(key, 60).ignore();
 //!             pipe.query_async(connection)
-//!                 .map(|(_, ())| ())
-//!         })
-//!     })).unwrap();
+//!                 .map_ok(|()| ())
+//!         }).await
+//!     }).unwrap();
 //! }
 //! ```
 
