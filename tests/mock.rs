@@ -15,7 +15,7 @@ use {
     tokio::runtime::current_thread::Runtime,
 };
 
-type Handler = Arc<dyn Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync>;
+type Handler = Arc<dyn Fn(&redis::Cmd, u16) -> Result<(), RedisResult<Value>> + Send + Sync>;
 
 lazy_static::lazy_static! {
     static ref HANDLERS: RwLock<HashMap<String, Handler>>
@@ -29,9 +29,9 @@ pub struct MockConnection {
 }
 
 impl Connect for MockConnection {
-    fn connect<T>(info: T) -> RedisFuture<'static, Self>
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, Self>
     where
-        T: IntoConnectionInfo,
+        T: IntoConnectionInfo + Send + 'a,
     {
         let info = info.into_connection_info().unwrap();
 
@@ -78,18 +78,18 @@ fn respond_startup(name: &str, cmd: &[u8]) -> Result<(), RedisResult<Value>> {
 }
 
 impl ConnectionLike for MockConnection {
-    fn req_packed_command(&mut self, cmd: Vec<u8>) -> RedisFuture<'_, Value> {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a redis::Cmd) -> RedisFuture<'a, Value> {
         Box::pin(future::ready(
             (self.handler)(&cmd, self.port).expect_err("Handler did not specify a response"),
         ))
     }
 
-    fn req_packed_commands(
-        &mut self,
-        _cmd: Vec<u8>,
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        _pipeline: &'a redis::Pipeline,
         _offset: usize,
         _count: usize,
-    ) -> RedisFuture<'_, Vec<Value>> {
+    ) -> RedisFuture<'a, Vec<Value>> {
         Box::pin(future::ok(vec![]))
     }
 
@@ -122,10 +122,10 @@ impl MockEnv {
         let mut runtime = Runtime::new().unwrap();
 
         let id = id.to_string();
-        HANDLERS
-            .write()
-            .unwrap()
-            .insert(id.clone(), Arc::new(handler));
+        HANDLERS.write().unwrap().insert(
+            id.clone(),
+            Arc::new(move |cmd, port| handler(&cmd.get_packed_command(), port)),
+        );
 
         let client = Client::open(vec![&*format!("redis://{}", id)]).unwrap();
         let connection = runtime.block_on(client.get_generic_connection()).unwrap();

@@ -18,18 +18,14 @@
 //!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
 //!
 //!     let mut runtime = Runtime::new().unwrap();
-//!     runtime.block_on(future::lazy(|| {
-//!         let client = Client::open(nodes).unwrap();
-//!         client.get_connection().and_then(|connection| {
-//!             cmd("SET").arg("test").arg("test_data").clone().query_async(connection)
-//!                 .and_then(|(connection, ())| {
-//!                     cmd("GET").arg("test").clone().query_async(connection)
-//!                 })
-//!                 .map(|(_, res): (_, String)| {
-//!                     assert_eq!(res, "test_data");
-//!                 })
-//!         })
-//!     })).unwrap()
+//!     runtime.block_on(async {
+//!         let client = Client::open(nodes)?;
+//!         let mut connection = client.get_connection().await?;
+//!         let () = cmd("SET").arg("test").arg("test_data").query_async(&mut connection).await?;
+//!         let res: String = cmd("GET").arg("test").query_async(&mut connection).await?;
+//!         assert_eq!(res, "test_data");
+//!         Ok(())
+//!     }).map_err(|err: redis::RedisError| err).unwrap();
 //! }
 //! ```
 //!
@@ -45,17 +41,17 @@
 //!
 //!     let mut runtime = Runtime::new().unwrap();
 //!     runtime.block_on(async move {
-//!         let client = Client::open(nodes).unwrap();
-//!         client.get_connection().and_then(|connection| {
-//!             let key = "test2";
+//!         let client = Client::open(nodes)?;
+//!         let mut connection = client.get_connection().await?;
+//!         let key = "test2";
 //!
-//!             let mut pipe = pipe();
-//!             pipe.rpush(key, "123").ignore()
-//!                 .ltrim(key, -10, -1).ignore()
-//!                 .expire(key, 60).ignore();
-//!             pipe.query_async(connection)
-//!                 .map_ok(|()| ())
-//!         }).await
+//!         let mut pipe = pipe();
+//!         pipe.rpush(key, "123").ignore()
+//!             .ltrim(key, -10, -1).ignore()
+//!             .expire(key, 60).ignore();
+//!         pipe.query_async(&mut connection)
+//!             .await
+//!             .map(|()| ())
 //!     }).unwrap();
 //! }
 //! ```
@@ -178,10 +174,53 @@ struct Pipeline<C> {
 }
 
 #[derive(Clone)]
-struct CmdArg {
-    cmd: Vec<u8>,
-    offset: usize,
-    count: usize,
+enum CmdArg<C> {
+    Cmd {
+        cmd: redis::Cmd,
+        func: fn(C, &redis::Cmd) -> RedisFuture<'static, Response>,
+    },
+    Pipeline {
+        pipeline: redis::Pipeline,
+        offset: usize,
+        count: usize,
+        func: fn(C, &redis::Pipeline, usize, usize) -> RedisFuture<'static, Response>,
+    },
+}
+
+impl<C> CmdArg<C> {
+    fn exec(&self, con: C) -> RedisFuture<'static, Response> {
+        match self {
+            Self::Cmd { cmd, func } => func(con, cmd),
+            Self::Pipeline {
+                pipeline,
+                offset,
+                count,
+                func,
+            } => func(con, pipeline, *offset, *count),
+        }
+    }
+
+    fn slot(&self) -> Option<u16> {
+        let slot_for_command = |cmd: &Cmd| {
+            cmd.args_iter().nth(1).and_then(|arg| match arg {
+                redis::Arg::Simple(key) => Some(slot_for_key(key)),
+                redis::Arg::Cursor => None, // FIXME ???
+            })
+        };
+        match self {
+            Self::Cmd { cmd, .. } => slot_for_command(cmd),
+            Self::Pipeline { pipeline, .. } => {
+                let mut iter = pipeline.cmd_iter();
+                let slot = iter.next().map(slot_for_command)?;
+                for cmd in iter {
+                    if slot != slot_for_command(cmd) {
+                        return None;
+                    }
+                }
+                slot
+            }
+        }
+    }
 }
 
 enum Response {
@@ -190,9 +229,8 @@ enum Response {
 }
 
 struct Message<C> {
-    cmd: CmdArg,
+    cmd: CmdArg<C>,
     sender: oneshot::Sender<RedisResult<Response>>,
-    func: fn(C, CmdArg) -> RedisFuture<'static, Response>,
 }
 
 enum ConnectionState<C> {
@@ -214,9 +252,8 @@ impl<C> fmt::Debug for ConnectionState<C> {
 }
 
 struct RequestInfo<C> {
-    cmd: CmdArg,
+    cmd: CmdArg<C>,
     slot: Option<u16>,
-    func: fn(C, CmdArg) -> RedisFuture<'static, Response>,
     excludes: HashSet<String>,
 }
 
@@ -267,7 +304,7 @@ where
                 Ok(Next::Done).into()
             }
             (addr, Err(err)) => {
-                trace!("Request error {} {:?}", err, self.info.cmd.cmd);
+                trace!("Request error {}", err);
 
                 match self.max_retries {
                     Some(max_retries) if self.retry == max_retries => {
@@ -505,7 +542,6 @@ where
     ) -> impl Future<Output = (String, RedisResult<Response>)> {
         // TODO remove clone by changing the ConnectionLike trait
         let cmd = info.cmd.clone();
-        let func = info.func;
         (if info.excludes.len() > 0 || info.slot.is_none() {
             future::Either::Left(future::ready(get_random_connection(
                 &self.connections,
@@ -514,7 +550,7 @@ where
         } else {
             future::Either::Right(self.get_connection(info.slot.unwrap()))
         })
-        .then(move |(addr, conn)| func(conn, cmd).map(|result| (addr, result)))
+        .then(move |(addr, conn)| cmd.exec(conn).map(|result| (addr, result)))
     }
 }
 
@@ -533,11 +569,10 @@ where
         let cmd = msg.cmd;
 
         let excludes = HashSet::new();
-        let slot = slot_for_packed_command(&cmd.cmd);
+        let slot = cmd.slot();
 
         let info = RequestInfo {
             cmd,
-            func: msg.func,
             slot,
             excludes,
         };
@@ -637,26 +672,23 @@ impl<C> ConnectionLike for Connection<C>
 where
     C: ConnectionLike + Send + 'static,
 {
-    fn req_packed_command(&mut self, cmd: Vec<u8>) -> RedisFuture<'_, Value> {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
         trace!("req_packed_command");
         let (sender, receiver) = oneshot::channel();
         Box::pin(async move {
             self.0
                 .clone()
                 .send(Message {
-                    cmd: CmdArg {
-                        cmd,
-                        offset: 0,
-                        count: 0,
+                    cmd: CmdArg::Cmd {
+                        cmd: cmd.clone(), // TODO Remove this clone?
+                        func: |mut conn, cmd| {
+                            let cmd = cmd.clone(); // TODO Remove this clone
+                            Box::pin(async move {
+                                conn.req_packed_command(&cmd).map_ok(Response::Single).await
+                            })
+                        },
                     },
                     sender,
-                    func: |mut conn, cmd| {
-                        Box::pin(async move {
-                            conn.req_packed_command(cmd.cmd)
-                                .map_ok(Response::Single)
-                                .await
-                        })
-                    },
                 })
                 .map_err(|_| {
                     RedisError::from(io::Error::new(
@@ -685,25 +717,30 @@ where
         })
     }
 
-    fn req_packed_commands(
-        &mut self,
-        cmd: Vec<u8>,
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
         offset: usize,
         count: usize,
-    ) -> RedisFuture<'_, Vec<Value>> {
+    ) -> RedisFuture<'a, Vec<Value>> {
         let (sender, receiver) = oneshot::channel();
         Box::pin(async move {
             self.0
                 .send(Message {
-                    cmd: CmdArg { cmd, offset, count },
-                    sender,
-                    func: |mut conn, cmd| {
-                        Box::pin(async move {
-                            conn.req_packed_commands(cmd.cmd, cmd.offset, cmd.count)
-                                .map_ok(Response::Multiple)
-                                .await
-                        })
+                    cmd: CmdArg::Pipeline {
+                        pipeline: pipeline.clone(), // TODO Remove this clone?
+                        offset,
+                        count,
+                        func: |mut conn, pipeline, offset, count| {
+                            let pipeline = pipeline.clone(); // TODO Remove this clone
+                            Box::pin(async move {
+                                conn.req_packed_commands(&pipeline, offset, count)
+                                    .map_ok(Response::Multiple)
+                                    .await
+                            })
+                        },
                     },
+                    sender,
                 })
                 .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
                 .and_then(move |_| {
@@ -737,41 +774,32 @@ impl Clone for Client {
     }
 }
 
-macro_rules! try_future {
-    ($e:expr) => {
-        try_future!($e, ::futures::future::FutureExt::boxed)
-    };
-    ($e:expr, $f:expr) => {
-        match $e {
-            Ok(x) => x,
-            Err(err) => return $f(::futures::future::err(err.into())),
-        }
-    };
-}
-
 trait ImplRedisFuture<T>: Future<Output = RedisResult<T>> {}
 impl<T, F> ImplRedisFuture<T> for F where F: Future<Output = RedisResult<T>> {}
 
 pub trait Connect: Sized {
-    fn connect<T>(info: T) -> RedisFuture<'static, Self>
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, Self>
     where
-        T: IntoConnectionInfo;
+        T: IntoConnectionInfo + Send + 'a;
 }
 
 impl Connect for redis::aio::SharedConnection {
-    fn connect<T>(info: T) -> RedisFuture<'static, redis::aio::SharedConnection>
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, redis::aio::SharedConnection>
     where
-        T: IntoConnectionInfo,
+        T: IntoConnectionInfo + Send + 'a,
     {
-        let connection_info = try_future!(info.into_connection_info());
-        let client = try_future!(redis::Client::open(connection_info));
-        client.get_shared_async_connection().boxed()
+        async move {
+            let connection_info = info.into_connection_info()?;
+            let client = redis::Client::open(connection_info)?;
+            client.get_shared_async_connection().await
+        }
+            .boxed()
     }
 }
 
-fn connect_and_check<T, C>(info: T) -> impl ImplRedisFuture<C>
+fn connect_and_check<'a, T, C>(info: T) -> impl ImplRedisFuture<C> + 'a
 where
-    T: IntoConnectionInfo,
+    T: IntoConnectionInfo + Send + 'a,
     C: ConnectionLike + Connect + Send + 'static,
 {
     C::connect(info).and_then(|mut conn| {
@@ -814,30 +842,9 @@ where
     (addr.to_string(), connections.get(addr).unwrap().clone())
 }
 
-fn slot_for_packed_command(cmd: &[u8]) -> Option<u16> {
-    command_key(cmd).map(|key| {
-        let key = sub_key(&key);
-        State::<XMODEM>::calculate(&key) % SLOT_SIZE as u16
-    })
-}
-
-fn command_key(cmd: &[u8]) -> Option<Vec<u8>> {
-    // TODO Avoid parsing the entire request to a `redis::Value`
-    redis::parse_redis_value(cmd)
-        .ok()
-        .and_then(|value| match value {
-            Value::Bulk(mut args) => {
-                if args.len() >= 2 {
-                    match args.swap_remove(1) {
-                        Value::Data(key) => Some(key),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
+fn slot_for_key(key: &[u8]) -> u16 {
+    let key = sub_key(&key);
+    State::<XMODEM>::calculate(&key) % SLOT_SIZE as u16
 }
 
 // If a key contains `{` and `}`, everything between the first occurence is the only thing that
@@ -893,9 +900,8 @@ where
     trace!("get_slots");
     let mut cmd = Cmd::new();
     cmd.arg("CLUSTER").arg("SLOTS");
-    let packed_command = cmd.get_packed_command();
     let value = connection
-        .req_packed_command(packed_command)
+        .req_packed_command(&cmd)
         .map_err(|err| {
             trace!("get_slots error: {}", err);
             err
@@ -971,6 +977,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slot_for_packed_command(cmd: &[u8]) -> Option<u16> {
+        command_key(cmd).map(|key| {
+            let key = sub_key(&key);
+            State::<XMODEM>::calculate(&key) % SLOT_SIZE as u16
+        })
+    }
+
+    fn command_key(cmd: &[u8]) -> Option<Vec<u8>> {
+        redis::parse_redis_value(cmd)
+            .ok()
+            .and_then(|value| match value {
+                Value::Bulk(mut args) => {
+                    if args.len() >= 2 {
+                        match args.swap_remove(1) {
+                            Value::Data(key) => Some(key),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+    }
 
     #[test]
     fn slot() {
