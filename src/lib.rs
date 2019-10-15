@@ -407,51 +407,38 @@ where
     }
 
     // Query a node to discover slot-> master mappings.
-    fn refresh_slots(&mut self) -> impl ImplRedisFuture<(SlotMap, HashMap<String, C>)> {
-        let slots_future = {
-            let samples = self.connections.values().cloned().collect::<Vec<_>>();
-
-            let mut found_slots = false;
-            async move {
-                stream::iter(samples)
-                    .then(|conn| {
-                        get_slots(conn).and_then(|v| future::ready(Self::build_slot_map(v)))
-                    })
-                    // Query connections until we find one that
-                    .take_while(move |result: &RedisResult<_>| {
-                        let take_this = !found_slots;
-                        found_slots = result.is_ok();
-                        future::ready(take_this)
-                    })
-                    // Get the last result which is either Ok or all nodes failed to return slots
-                    // to us
-                    .fold(None, |_, result| future::ready(Some(result)))
-                    .map(move |opt| {
-                        opt.ok_or_else(|| {
-                            RedisError::from((
-                                ErrorKind::IoError,
-                                "No connections to refresh slots from",
-                            ))
-                        })?
-                    })
-                    .await
-            }
-        };
-        let connections = mem::replace(&mut self.connections, Default::default());
+    fn refresh_slots(
+        &mut self,
+    ) -> impl Future<Output = RedisResult<(SlotMap, HashMap<String, C>)>> {
+        let mut connections = mem::replace(&mut self.connections, Default::default());
 
         async move {
+            let mut result = Ok(SlotMap::new());
+            for conn in connections.values_mut() {
+                match get_slots(&mut *conn)
+                    .await
+                    .and_then(|v| Self::build_slot_map(v))
+                {
+                    Ok(s) => {
+                        result = Ok(s);
+                        break;
+                    }
+                    Err(err) => result = Err(err),
+                }
+            }
+            let slots = result?;
+
             // Remove dead connections and connect to new nodes if necessary
             let new_connections = HashMap::with_capacity(connections.len());
 
-            let slots = slots_future.await?;
-            stream::iter(slots.values().cloned().collect::<Vec<_>>())
+            let (_, connections) = stream::iter(slots.values())
                 .fold(
                     (connections, new_connections),
                     move |(mut connections, mut new_connections), addr| {
                         async move {
-                            if !new_connections.contains_key(&addr) {
+                            if !new_connections.contains_key(addr) {
                                 let new_connection = if let Some(mut conn) =
-                                    connections.remove(&addr)
+                                    connections.remove(addr)
                                 {
                                     match check_connection(&mut conn).await {
                                         Ok(_) => Some((addr.to_string(), conn)),
@@ -472,8 +459,8 @@ where
                         }
                     },
                 )
-                .map(|(_, connections)| Ok::<_, RedisError>((slots, connections)))
-                .await
+                .await;
+            Ok((slots, connections))
         }
     }
 
@@ -677,7 +664,6 @@ where
         let (sender, receiver) = oneshot::channel();
         Box::pin(async move {
             self.0
-                .clone()
                 .send(Message {
                     cmd: CmdArg::Cmd {
                         cmd: cmd.clone(), // TODO Remove this clone?
@@ -696,24 +682,19 @@ where
                         "redis_cluster: Unable to send command",
                     ))
                 })
-                .and_then(move |_| {
-                    receiver.then(|result| {
-                        future::ready(
-                            result
-                                .unwrap_or_else(|_| {
-                                    Err(RedisError::from(io::Error::new(
-                                        io::ErrorKind::BrokenPipe,
-                                        "redis_cluster: Unable to receive command",
-                                    )))
-                                })
-                                .map(|response| match response {
-                                    Response::Single(value) => value,
-                                    Response::Multiple(_) => unreachable!(),
-                                }),
-                        )
-                    })
-                })
+                .await?;
+            receiver
                 .await
+                .unwrap_or_else(|_| {
+                    Err(RedisError::from(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "redis_cluster: Unable to receive command",
+                    )))
+                })
+                .map(|response| match response {
+                    Response::Single(value) => value,
+                    Response::Multiple(_) => unreachable!(),
+                })
         })
     }
 
@@ -743,23 +724,17 @@ where
                     sender,
                 })
                 .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
-                .and_then(move |_| {
-                    receiver.then(|result| {
-                        future::ready(
-                            result
-                                .unwrap_or_else(|_| {
-                                    Err(RedisError::from(io::Error::from(
-                                        io::ErrorKind::BrokenPipe,
-                                    )))
-                                })
-                                .map(|response| match response {
-                                    Response::Multiple(values) => values,
-                                    Response::Single(_) => unreachable!(),
-                                }),
-                        )
-                    })
-                })
+                .await?;
+
+            receiver
                 .await
+                .unwrap_or_else(|_| {
+                    Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
+                })
+                .map(|response| match response {
+                    Response::Multiple(values) => values,
+                    Response::Single(_) => unreachable!(),
+                })
         })
     }
 
@@ -893,7 +868,7 @@ impl Slot {
 }
 
 // Get slot data from connection.
-async fn get_slots<C>(mut connection: C) -> RedisResult<Vec<Slot>>
+async fn get_slots<C>(connection: &mut C) -> RedisResult<Vec<Slot>>
 where
     C: ConnectionLike,
 {
