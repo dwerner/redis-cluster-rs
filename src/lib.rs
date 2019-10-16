@@ -65,6 +65,7 @@ use std::{
     marker::Unpin,
     mem,
     pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
@@ -176,37 +177,37 @@ struct Pipeline<C> {
 #[derive(Clone)]
 enum CmdArg<C> {
     Cmd {
-        cmd: redis::Cmd,
-        func: fn(C, &redis::Cmd) -> RedisFuture<'static, Response>,
+        cmd: Arc<redis::Cmd>,
+        func: fn(C, Arc<redis::Cmd>) -> RedisFuture<'static, Response>,
     },
     Pipeline {
-        pipeline: redis::Pipeline,
+        pipeline: Arc<redis::Pipeline>,
         offset: usize,
         count: usize,
-        func: fn(C, &redis::Pipeline, usize, usize) -> RedisFuture<'static, Response>,
+        func: fn(C, Arc<redis::Pipeline>, usize, usize) -> RedisFuture<'static, Response>,
     },
 }
 
 impl<C> CmdArg<C> {
     fn exec(&self, con: C) -> RedisFuture<'static, Response> {
         match self {
-            Self::Cmd { cmd, func } => func(con, cmd),
+            Self::Cmd { cmd, func } => func(con, cmd.clone()),
             Self::Pipeline {
                 pipeline,
                 offset,
                 count,
                 func,
-            } => func(con, pipeline, *offset, *count),
+            } => func(con, pipeline.clone(), *offset, *count),
         }
     }
 
     fn slot(&self) -> Option<u16> {
-        let slot_for_command = |cmd: &Cmd| {
+        fn slot_for_command(cmd: &Cmd) -> Option<u16> {
             cmd.args_iter().nth(1).and_then(|arg| match arg {
                 redis::Arg::Simple(key) => Some(slot_for_key(key)),
                 redis::Arg::Cursor => None, // FIXME ???
             })
-        };
+        }
         match self {
             Self::Cmd { cmd, .. } => slot_for_command(cmd),
             Self::Pipeline { pipeline, .. } => {
@@ -666,9 +667,8 @@ where
             self.0
                 .send(Message {
                     cmd: CmdArg::Cmd {
-                        cmd: cmd.clone(), // TODO Remove this clone?
+                        cmd: Arc::new(cmd.clone()), // TODO Remove this clone?
                         func: |mut conn, cmd| {
-                            let cmd = cmd.clone(); // TODO Remove this clone
                             Box::pin(async move {
                                 conn.req_packed_command(&cmd).map_ok(Response::Single).await
                             })
@@ -709,11 +709,10 @@ where
             self.0
                 .send(Message {
                     cmd: CmdArg::Pipeline {
-                        pipeline: pipeline.clone(), // TODO Remove this clone?
+                        pipeline: Arc::new(pipeline.clone()), // TODO Remove this clone?
                         offset,
                         count,
                         func: |mut conn, pipeline, offset, count| {
-                            let pipeline = pipeline.clone(); // TODO Remove this clone
                             Box::pin(async move {
                                 conn.req_packed_commands(&pipeline, offset, count)
                                     .map_ok(Response::Multiple)
