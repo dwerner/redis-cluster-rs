@@ -145,7 +145,7 @@ impl Client {
 
 /// This is a connection of Redis cluster.
 #[derive(Clone)]
-pub struct Connection<C = redis::aio::SharedConnection>(mpsc::Sender<Message<C>>);
+pub struct Connection<C = redis::aio::MultiplexedConnection>(mpsc::Sender<Message<C>>);
 
 impl<C> Connection<C>
 where
@@ -757,15 +757,15 @@ pub trait Connect: Sized {
         T: IntoConnectionInfo + Send + 'a;
 }
 
-impl Connect for redis::aio::SharedConnection {
-    fn connect<'a, T>(info: T) -> RedisFuture<'a, redis::aio::SharedConnection>
+impl Connect for redis::aio::MultiplexedConnection {
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, redis::aio::MultiplexedConnection>
     where
         T: IntoConnectionInfo + Send + 'a,
     {
         async move {
             let connection_info = info.into_connection_info()?;
             let client = redis::Client::open(connection_info)?;
-            client.get_shared_async_connection().await
+            client.get_multiplexed_async_connection().await
         }
             .boxed()
     }

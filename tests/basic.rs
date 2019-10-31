@@ -41,7 +41,7 @@ pub struct RedisEnv {
     _redis_lock: RedisLock,
     pub runtime: Runtime,
     pub client: Client,
-    nodes: Vec<redis::aio::SharedConnection>,
+    nodes: Vec<redis::aio::MultiplexedConnection>,
 }
 
 impl RedisEnv {
@@ -57,7 +57,7 @@ impl RedisEnv {
         let node_infos = loop {
             let node_infos = runtime
                 .block_on(async {
-                    let mut conn = redis_client.get_shared_async_connection().await?;
+                    let mut conn = redis_client.get_multiplexed_async_connection().await?;
                     Self::cluster_info(&mut conn).await
                 })
                 .expect("Unable to query nodes for information");
@@ -85,7 +85,7 @@ impl RedisEnv {
 
             nodes.push(
                 runtime
-                    .block_on(async { redis_client.get_shared_async_connection().await })
+                    .block_on(async { redis_client.get_multiplexed_async_connection().await })
                     .unwrap(),
             );
         }
@@ -214,7 +214,7 @@ impl FailoverEnv {
 }
 
 async fn do_failover(
-    redis: &mut redis::aio::SharedConnection,
+    redis: &mut redis::aio::MultiplexedConnection,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     cmd("CLUSTER")
         .arg("FAILOVER")
