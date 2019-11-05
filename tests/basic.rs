@@ -57,7 +57,7 @@ impl RedisEnv {
         let node_infos = loop {
             let node_infos = runtime
                 .block_on(async {
-                    let mut conn = redis_client.get_multiplexed_async_connection().await?;
+                    let mut conn = redis_client.get_multiplexed_tokio_connection().await?;
                     Self::cluster_info(&mut conn).await
                 })
                 .expect("Unable to query nodes for information");
@@ -85,7 +85,7 @@ impl RedisEnv {
 
             nodes.push(
                 runtime
-                    .block_on(async { redis_client.get_multiplexed_async_connection().await })
+                    .block_on(async { redis_client.get_multiplexed_tokio_connection().await })
                     .unwrap(),
             );
         }

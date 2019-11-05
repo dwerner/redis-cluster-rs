@@ -130,16 +130,16 @@ impl Client {
     /// # Errors
     ///
     /// If it is failed to open connections and to create slots, an error is returned.
-    pub fn get_connection(&self) -> impl Future<Output = RedisResult<Connection>> {
-        Connection::new(self.initial_nodes.clone(), self.retries)
+    pub async fn get_connection(&self) -> RedisResult<Connection> {
+        Connection::new(&self.initial_nodes, self.retries).await
     }
 
     #[doc(hidden)]
-    pub fn get_generic_connection<C>(&self) -> impl Future<Output = RedisResult<Connection<C>>>
+    pub async fn get_generic_connection<C>(&self) -> RedisResult<Connection<C>>
     where
         C: ConnectionLike + Connect + Clone + Send + Unpin + 'static,
     {
-        Connection::new(self.initial_nodes.clone(), self.retries)
+        Connection::new(&self.initial_nodes, self.retries).await
     }
 }
 
@@ -151,15 +151,17 @@ impl<C> Connection<C>
 where
     C: ConnectionLike + Connect + Clone + Send + Unpin + 'static,
 {
-    fn new(
-        initial_nodes: Vec<ConnectionInfo>,
+    async fn new(
+        initial_nodes: &[ConnectionInfo],
         retries: Option<u32>,
-    ) -> impl ImplRedisFuture<Connection<C>> {
-        Pipeline::new(initial_nodes, retries).map_ok(|pipeline| {
-            let (tx, rx) = mpsc::channel::<Message<_>>(100);
-            tokio_executor::spawn(rx.map(Ok).forward(pipeline).map(|_| ()));
-            Connection(tx)
-        })
+    ) -> RedisResult<Connection<C>> {
+        Pipeline::new(initial_nodes, retries)
+            .map_ok(|pipeline| {
+                let (tx, rx) = mpsc::channel::<Message<_>>(100);
+                tokio_executor::spawn(rx.map(Ok).forward(pipeline).map(|_| ()));
+                Connection(tx)
+            })
+            .await
     }
 }
 
@@ -357,8 +359,8 @@ impl<C> Pipeline<C>
 where
     C: ConnectionLike + Connect + Clone + Send + 'static,
 {
-    async fn new(initial_nodes: Vec<ConnectionInfo>, retries: Option<u32>) -> RedisResult<Self> {
-        let connections = Self::create_initial_connections(&initial_nodes).await?;
+    async fn new(initial_nodes: &[ConnectionInfo], retries: Option<u32>) -> RedisResult<Self> {
+        let connections = Self::create_initial_connections(initial_nodes).await?;
         let mut connection = Pipeline {
             connections,
             slots: Default::default(),
@@ -372,10 +374,10 @@ where
         Ok(connection)
     }
 
-    fn create_initial_connections(
-        initial_nodes: &Vec<ConnectionInfo>,
-    ) -> impl ImplRedisFuture<HashMap<String, C>> {
-        stream::iter(initial_nodes.clone())
+    async fn create_initial_connections(
+        initial_nodes: &[ConnectionInfo],
+    ) -> RedisResult<HashMap<String, C>> {
+        stream::iter(initial_nodes)
             .then(|info| {
                 let addr = match *info.addr {
                     ConnectionAddr::Tcp(ref host, port) => format!("redis://{}:{}", host, port),
@@ -405,6 +407,7 @@ where
                 }
                 Ok(connections)
             })
+            .await
     }
 
     // Query a node to discover slot-> master mappings.
@@ -765,9 +768,9 @@ impl Connect for redis::aio::MultiplexedConnection {
         async move {
             let connection_info = info.into_connection_info()?;
             let client = redis::Client::open(connection_info)?;
-            client.get_multiplexed_async_connection().await
+            client.get_multiplexed_tokio_connection().await
         }
-            .boxed()
+        .boxed()
     }
 }
 

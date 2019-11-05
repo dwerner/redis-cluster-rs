@@ -16,7 +16,7 @@ crc16 = "0.4"
 futures = { version = "0.3.0-alpha.18", package = "futures-preview" }
 rand = "0.7"
 pin-project = "0.4"
-redis = { path = "../redis-rs", features = ["tokio-executor"] }
+redis = { git = "https://github.com/Marwes/redis-rs", branch = "async_await_api", features = ["tokio-executor"] }
 tokio-executor = "0.2.0-alpha.6"
 tokio-timer = "0.3.0-alpha.6"
 log = "0.4"
