@@ -774,6 +774,20 @@ impl Connect for redis::aio::MultiplexedConnection {
     }
 }
 
+impl Connect for redis::aio::Connection {
+    fn connect<'a, T>(info: T) -> RedisFuture<'a, redis::aio::Connection>
+    where
+        T: IntoConnectionInfo + Send + 'a,
+    {
+        async move {
+            let connection_info = info.into_connection_info()?;
+            let client = redis::Client::open(connection_info)?;
+            client.get_async_connection().await
+        }
+        .boxed()
+    }
+}
+
 fn connect_and_check<'a, T, C>(info: T) -> impl ImplRedisFuture<C> + 'a
 where
     T: IntoConnectionInfo + Send + 'a,
