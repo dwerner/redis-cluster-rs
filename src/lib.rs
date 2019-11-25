@@ -76,7 +76,7 @@ use futures::{
     prelude::*,
     ready, stream, task, Poll,
 };
-use log::trace;
+use log::{ trace, debug };
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
 use redis::{
@@ -165,7 +165,7 @@ where
     }
 }
 
-type SlotMap = BTreeMap<u16, String>;
+type SlotMap = BTreeMap<(u16, u16), String>;
 
 struct Pipeline<C> {
     connections: HashMap<String, C>,
@@ -276,6 +276,7 @@ struct Request<F, I, C> {
 
 #[must_use]
 enum Next {
+    Moved{ slot: u16, addr: String },
     TryNewConnection,
     Done,
 }
@@ -307,7 +308,7 @@ where
                 Ok(Next::Done).into()
             }
             (addr, Err(err)) => {
-                trace!("Request error {}", err);
+                debug!("{:?} Request error {}", addr, err);
 
                 match self.max_retries {
                     Some(max_retries) if self.retry == max_retries => {
@@ -320,6 +321,21 @@ where
 
                 if let Some(error_code) = err.extension_error_code() {
                     if error_code == "MOVED" || error_code == "ASK" {
+
+                        // HACK - parse the slot and addr from the MOVED response
+                        if error_code == "MOVED"  {   
+                            debug!("MOVED... connections_len {}", connections_len);
+                            let e = format!("{}", err);
+                            let parts = e.split(' ').collect::<Vec<_>>();
+                            debug!("parts {:?}", parts);
+                            return Ok(
+                                Next::Moved{
+                                    slot: parts[1].parse::<u16>().unwrap(),
+                                    addr: parts[2].to_string()
+                                }
+                            ).into()
+                        }
+
                         // Refresh slots and request again.
                         self.info.excludes.clear();
                         return Err(err).into();
@@ -399,7 +415,7 @@ where
                 },
             )
             .map(|connections| {
-                if connections.len() == 0 {
+                if connections.is_empty() {
                     return Err(RedisError::from((
                         ErrorKind::IoError,
                         "Failed to create initial connections",
@@ -414,6 +430,7 @@ where
     fn refresh_slots(
         &mut self,
     ) -> impl Future<Output = RedisResult<(SlotMap, HashMap<String, C>)>> {
+        debug!("refresh_slots");
         let mut connections = mem::replace(&mut self.connections, Default::default());
 
         async move {
@@ -421,7 +438,7 @@ where
             for conn in connections.values_mut() {
                 match get_slots(&mut *conn)
                     .await
-                    .and_then(|v| Self::build_slot_map(v))
+                    .and_then(Self::build_slot_map)
                 {
                     Ok(s) => {
                         result = Ok(s);
@@ -464,6 +481,7 @@ where
                     },
                 )
                 .await;
+            debug!("refreshed {:?}", slots);
             Ok((slots, connections))
         }
     }
@@ -481,7 +499,7 @@ where
                     ),
                 )));
             }
-            Ok(slot_data.end() + 1)
+            Ok(slot_data.end()+1)
         })?;
 
         if usize::from(last_slot) != SLOT_SIZE {
@@ -493,15 +511,18 @@ where
         }
         let slot_map = slots_data
             .iter()
-            .map(|slot_data| (slot_data.end(), slot_data.master().to_string()))
+            .map(|slot_data| ((slot_data.start(), slot_data.end()), slot_data.master().to_string()))
             .collect();
-        trace!("{:?}", slot_map);
+        debug!("slot map {:?}", slot_map);
         Ok(slot_map)
     }
 
     fn get_connection(&self, slot: u16) -> impl Future<Output = (String, C)> + 'static {
-        if let Some((_, addr)) = self.slots.range(&slot..).next() {
+        debug!("get_connection with slot {} -> self.slots {:?}", slot, self.slots);
+        let slot = self.slots.iter().find(|((start, end), _)| slot >= *start && slot < *end);
+        if let Some((_, addr)) = slot {
             if self.connections.contains_key(addr) {
+                debug!("get_connection {:?}", addr);
                 return future::Either::Left(future::ready((
                     addr.clone(),
                     self.connections.get(addr).unwrap().clone(),
@@ -532,14 +553,17 @@ where
         info: &RequestInfo<C>,
     ) -> impl Future<Output = (String, RedisResult<Response>)> {
         // TODO remove clone by changing the ConnectionLike trait
+        debug!("try_request");
         let cmd = info.cmd.clone();
-        (if info.excludes.len() > 0 || info.slot.is_none() {
-            future::Either::Left(future::ready(get_random_connection(
+        (if !info.excludes.is_empty() || info.slot.is_none() {
+            let conn = get_random_connection(
                 &self.connections,
                 Some(&info.excludes),
-            )))
+            );
+            future::Either::Left(future::ready(conn))
         } else {
-            future::Either::Right(self.get_connection(info.slot.unwrap()))
+            let conn = self.get_connection(info.slot.unwrap());
+            future::Either::Right(conn)
         })
         .then(move |(addr, conn)| cmd.exec(conn).map(|result| (addr, result)))
     }
@@ -575,7 +599,7 @@ where
             info,
         };
         self.in_flight_requests.push(request);
-        Ok(()).into()
+        Ok(())
     }
 
     fn poll_flush(
@@ -597,7 +621,8 @@ where
                         trace!("Recover not ready");
                         return Poll::Pending;
                     }
-                    Poll::Ready(Err(_err)) => {
+                    Poll::Ready(Err(err)) => {
+                        trace!("err {:?} calling refresh_slots", err);
                         ConnectionState::Recover(Box::pin(self.refresh_slots()))
                     }
                 },
@@ -625,6 +650,16 @@ where
                                     }
                                     Next::TryNewConnection => {
                                         let mut request = self.in_flight_requests.swap_remove(i);
+                                        request.future = RequestState::Future(Box::pin(
+                                            self.try_request(&request.info),
+                                        ));
+                                        self.in_flight_requests.push(request);
+                                    }
+                                    Next::Moved{slot, addr} => {
+                                        debug!("moved {}, {}", slot, addr);
+                                        debug!("slots {:?}", self_.slots);
+                                        let mut request = self.in_flight_requests.swap_remove(i);
+                                        request.info.slot = Some(slot);
                                         request.future = RequestState::Future(Box::pin(
                                             self.try_request(&request.info),
                                         ));
@@ -830,6 +865,7 @@ where
     };
 
     let addr = sample.expect("No targets to choose from");
+    debug!("get_random_connection {:?}", addr);
     (addr.to_string(), connections.get(addr).unwrap().clone())
 }
 
@@ -948,7 +984,7 @@ where
                 })
                 .collect();
 
-            if nodes.len() < 1 {
+            if nodes.is_empty() {
                 continue;
             }
 
