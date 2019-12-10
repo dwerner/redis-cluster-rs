@@ -205,6 +205,23 @@ impl<C> CmdArg<C> {
 
     fn slot(&self) -> Option<u16> {
         fn slot_for_command(cmd: &Cmd) -> Option<u16> {
+
+            // TODO: more sophistocated command reflection...
+            // HACK: early recognition of STREAMS call
+            let streams_idx = cmd.args_iter()
+                .enumerate()
+                .find(|(_, arg)| match arg {
+                    redis::Arg::Simple(a) if String::from_utf8_lossy(a)
+                        .eq_ignore_ascii_case("STREAMS") => true,
+                    _ => false
+                }).map(|(i, _)| i);
+
+            if let Some(idx) = streams_idx {
+                if let Some(redis::Arg::Simple(key)) = cmd.args_iter().nth(idx + 1) {
+                    return Some(slot_for_key(key))
+                }
+            }
+
             cmd.args_iter().nth(1).and_then(|arg| match arg {
                 redis::Arg::Simple(key) => Some(slot_for_key(key)),
                 redis::Arg::Cursor => None, // FIXME ???
@@ -277,6 +294,7 @@ struct Request<F, I, C> {
 #[must_use]
 enum Next {
     Moved{ slot: u16, addr: String },
+    Ask{ slot: u16, addr: String },
     TryNewConnection,
     Done,
 }
@@ -308,7 +326,7 @@ where
                 Ok(Next::Done).into()
             }
             (addr, Err(err)) => {
-                debug!("{:?} Request error {}", addr, err);
+                trace!("{:?} Request error {}", addr, err);
 
                 match self.max_retries {
                     Some(max_retries) if self.retry == max_retries => {
@@ -320,25 +338,22 @@ where
                 self.retry = self.retry.saturating_add(1);
 
                 if let Some(error_code) = err.extension_error_code() {
-                    if error_code == "MOVED" || error_code == "ASK" {
-
-                        // HACK - parse the slot and addr from the MOVED response
-                        if error_code == "MOVED"  {   
-                            debug!("MOVED... connections_len {}", connections_len);
-                            let e = format!("{}", err);
-                            let parts = e.split(' ').collect::<Vec<_>>();
-                            debug!("parts {:?}", parts);
-                            return Ok(
-                                Next::Moved{
-                                    slot: parts[1].parse::<u16>().unwrap(),
-                                    addr: parts[2].to_string()
-                                }
-                            ).into()
-                        }
-
-                        // Refresh slots and request again.
-                        self.info.excludes.clear();
-                        return Err(err).into();
+                    if  error_code == "MOVED" {
+                        let e = format!("{}", err);
+                        let parts = e.split(' ').collect::<Vec<_>>();
+                        debug_assert!(parts.len() == 3, "unexpected MOVED message format");
+                        return Ok(Next::Moved{
+                                slot: parts[1].parse::<u16>().expect("expected a u16"),
+                                addr: parts[2].to_string()
+                            }).into()
+                    } else if error_code == "ASK" {
+                        let e = format!("{}", err);
+                        let parts = e.split(' ').collect::<Vec<_>>();
+                        debug_assert!(parts.len() == 3, "unexpected ASK message format");
+                        return Ok(Next::Ask{
+                                slot: parts[1].parse::<u16>().expect("expected a u16"),
+                                addr: parts[2].to_string()
+                            }).into()
                     } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                         // Sleep and retry.
                         let sleep_duration =
@@ -430,7 +445,7 @@ where
     fn refresh_slots(
         &mut self,
     ) -> impl Future<Output = RedisResult<(SlotMap, HashMap<String, C>)>> {
-        debug!("refresh_slots");
+        trace!("refresh_slots");
         let mut connections = mem::replace(&mut self.connections, Default::default());
 
         async move {
@@ -481,7 +496,7 @@ where
                     },
                 )
                 .await;
-            debug!("refreshed {:?}", slots);
+            trace!("refreshed {:?}", slots);
             Ok((slots, connections))
         }
     }
@@ -513,16 +528,16 @@ where
             .iter()
             .map(|slot_data| ((slot_data.start(), slot_data.end()), slot_data.master().to_string()))
             .collect();
-        debug!("slot map {:?}", slot_map);
+        trace!("slot map {:?}", slot_map);
         Ok(slot_map)
     }
 
     fn get_connection(&self, slot: u16) -> impl Future<Output = (String, C)> + 'static {
-        debug!("get_connection with slot {} -> self.slots {:?}", slot, self.slots);
+        trace!("get_connection with slot {} -> self.slots {:?}", slot, self.slots);
         let slot = self.slots.iter().find(|((start, end), _)| slot >= *start && slot < *end);
         if let Some((_, addr)) = slot {
             if self.connections.contains_key(addr) {
-                debug!("get_connection {:?}", addr);
+                trace!("get_connection {:?}", addr);
                 return future::Either::Left(future::ready((
                     addr.clone(),
                     self.connections.get(addr).unwrap().clone(),
@@ -553,7 +568,7 @@ where
         info: &RequestInfo<C>,
     ) -> impl Future<Output = (String, RedisResult<Response>)> {
         // TODO remove clone by changing the ConnectionLike trait
-        debug!("try_request");
+        trace!("try_request slot {:?}", info.slot);
         let cmd = info.cmd.clone();
         (if !info.excludes.is_empty() || info.slot.is_none() {
             let conn = get_random_connection(
@@ -655,9 +670,22 @@ where
                                         ));
                                         self.in_flight_requests.push(request);
                                     }
+
+                                    // ASK is intended to ask the directed connection for just this
+                                    // request
+                                    Next::Ask{slot, addr} => {
+                                        trace!("ASK {}, {}", slot, addr);
+                                        let mut request = self.in_flight_requests.swap_remove(i);
+                                        request.info.slot = Some(slot);
+                                        request.future = RequestState::Future(Box::pin(
+                                            self.try_request(&request.info),
+                                        ));
+                                        self.in_flight_requests.push(request);
+                                    }
+
+                                    // moved needs to update the slot map
                                     Next::Moved{slot, addr} => {
-                                        debug!("moved {}, {}", slot, addr);
-                                        debug!("slots {:?}", self_.slots);
+                                        trace!("MOVED {}, {}", slot, addr);
                                         let mut request = self.in_flight_requests.swap_remove(i);
                                         request.info.slot = Some(slot);
                                         request.future = RequestState::Future(Box::pin(
@@ -865,7 +893,7 @@ where
     };
 
     let addr = sample.expect("No targets to choose from");
-    debug!("get_random_connection {:?}", addr);
+    trace!("get_random_connection {:?}", addr);
     (addr.to_string(), connections.get(addr).unwrap().clone())
 }
 
