@@ -1,7 +1,7 @@
 //! This is a rust implementation for Redis cluster library.
 //!
 //! This library extends redis-rs library to be able to use cluster.
-//! Client impletemts traits of ConnectionLike and Commands.
+//! Client implements traits of ConnectionLike and Commands.
 //! So you can use redis-rs's access methods.
 //! If you want more information, read document of redis-rs.
 //!
@@ -9,11 +9,10 @@
 //!
 //! # Example
 //! ```rust
-//! use tokio::{prelude::*, runtime::current_thread::Runtime};
-//!
 //! use redis_cluster_async::{Client, redis::{Commands, cmd}};
 //!
-//! fn main() {
+//! #[tokio::main]
+//! async fn main() -> redis::RedisResult<()> {
 //! #   let _ = env_logger::try_init();
 //!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
 //!
@@ -31,11 +30,10 @@
 //!
 //! # Pipelining
 //! ```rust
-//! use tokio::{prelude::*, runtime::current_thread::Runtime};
-//!
 //! use redis_cluster_async::{Client, redis::{PipelineCommands, pipe}};
 //!
-//! fn main() {
+//! #[tokio::main]
+//! async fn main() -> redis::RedisResult<()> {
 //! #   let _ = env_logger::try_init();
 //!     let nodes = vec!["redis://127.0.0.1:7000/", "redis://127.0.0.1:7001/", "redis://127.0.0.1:7002/"];
 //!
@@ -74,9 +72,9 @@ use futures::{
     channel::{mpsc, oneshot},
     future::{self, BoxFuture},
     prelude::*,
-    ready, stream, task, Poll,
+    ready, stream, task, task::Poll,
 };
-use log::{ trace, debug };
+use log::{ trace };
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
 use redis::{
@@ -158,7 +156,7 @@ where
         Pipeline::new(initial_nodes, retries)
             .map_ok(|pipeline| {
                 let (tx, rx) = mpsc::channel::<Message<_>>(100);
-                tokio_executor::spawn(rx.map(Ok).forward(pipeline).map(|_| ()));
+                tokio::spawn(rx.map(Ok).forward(pipeline).map(|_| ()));
                 Connection(tx)
             })
             .await
@@ -280,7 +278,7 @@ struct RequestInfo<C> {
 enum RequestState<F> {
     None,
     Future(F),
-    Delay(tokio_timer::Delay),
+    Delay(tokio::time::Delay),
 }
 
 struct Request<F, I, C> {
@@ -343,23 +341,23 @@ where
                         let parts = e.split(' ').collect::<Vec<_>>();
                         debug_assert!(parts.len() == 3, "unexpected MOVED message format");
                         return Ok(Next::Moved{
-                                slot: parts[1].parse::<u16>().expect("expected a u16"),
-                                addr: parts[2].to_string()
-                            }).into()
+                            slot: parts[1].parse::<u16>().expect("expected a u16"),
+                            addr: parts[2].to_string()
+                        }).into()
                     } else if error_code == "ASK" {
                         let e = format!("{}", err);
                         let parts = e.split(' ').collect::<Vec<_>>();
                         debug_assert!(parts.len() == 3, "unexpected ASK message format");
                         return Ok(Next::Ask{
-                                slot: parts[1].parse::<u16>().expect("expected a u16"),
-                                addr: parts[2].to_string()
-                            }).into()
+                            slot: parts[1].parse::<u16>().expect("expected a u16"),
+                            addr: parts[2].to_string()
+                        }).into()
                     } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
                         // Sleep and retry.
                         let sleep_duration =
                             Duration::from_millis(2u64.pow(self.retry.max(7).min(16)) * 10);
                         self.info.excludes.clear();
-                        self.future = RequestState::Delay(tokio_timer::delay_for(sleep_duration));
+                        self.future = RequestState::Delay(tokio::time::delay_for(sleep_duration));
                         return self.poll_request(cx, connections_len);
                     }
                 }
@@ -445,7 +443,6 @@ where
     fn refresh_slots(
         &mut self,
     ) -> impl Future<Output = RedisResult<(SlotMap, HashMap<String, C>)>> {
-        trace!("refresh_slots");
         let mut connections = mem::replace(&mut self.connections, Default::default());
 
         async move {
@@ -496,7 +493,6 @@ where
                     },
                 )
                 .await;
-            trace!("refreshed {:?}", slots);
             Ok((slots, connections))
         }
     }
@@ -514,7 +510,7 @@ where
                     ),
                 )));
             }
-            Ok(slot_data.end()+1)
+            Ok(slot_data.end() + 1)
         })?;
 
         if usize::from(last_slot) != SLOT_SIZE {
@@ -528,16 +524,13 @@ where
             .iter()
             .map(|slot_data| ((slot_data.start(), slot_data.end()), slot_data.master().to_string()))
             .collect();
-        trace!("slot map {:?}", slot_map);
         Ok(slot_map)
     }
 
     fn get_connection(&self, slot: u16) -> impl Future<Output = (String, C)> + 'static {
-        trace!("get_connection with slot {} -> self.slots {:?}", slot, self.slots);
         let slot = self.slots.iter().find(|((start, end), _)| slot >= *start && slot < *end);
         if let Some((_, addr)) = slot {
             if self.connections.contains_key(addr) {
-                trace!("get_connection {:?}", addr);
                 return future::Either::Left(future::ready((
                     addr.clone(),
                     self.connections.get(addr).unwrap().clone(),
@@ -568,7 +561,6 @@ where
         info: &RequestInfo<C>,
     ) -> impl Future<Output = (String, RedisResult<Response>)> {
         // TODO remove clone by changing the ConnectionLike trait
-        trace!("try_request slot {:?}", info.slot);
         let cmd = info.cmd.clone();
         (if !info.excludes.is_empty() || info.slot.is_none() {
             let conn = get_random_connection(
@@ -636,8 +628,7 @@ where
                         trace!("Recover not ready");
                         return Poll::Pending;
                     }
-                    Poll::Ready(Err(err)) => {
-                        trace!("err {:?} calling refresh_slots", err);
+                    Poll::Ready(Err(_err)) => {
                         ConnectionState::Recover(Box::pin(self.refresh_slots()))
                     }
                 },
@@ -670,7 +661,6 @@ where
                                         ));
                                         self.in_flight_requests.push(request);
                                     }
-
                                     // ASK is intended to ask the directed connection for just this
                                     // request
                                     Next::Ask{slot, addr} => {
@@ -683,7 +673,7 @@ where
                                         self.in_flight_requests.push(request);
                                     }
 
-                                    // moved needs to update the slot map
+                                    // MOVED needs to update the slot map
                                     Next::Moved{slot, addr} => {
                                         trace!("MOVED {}, {}", slot, addr);
                                         let mut request = self.in_flight_requests.swap_remove(i);
@@ -893,7 +883,6 @@ where
     };
 
     let addr = sample.expect("No targets to choose from");
-    trace!("get_random_connection {:?}", addr);
     (addr.to_string(), connections.get(addr).unwrap().clone())
 }
 

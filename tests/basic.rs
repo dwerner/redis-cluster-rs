@@ -7,7 +7,7 @@ use std::{
 use {
     futures::{prelude::*, stream},
     proptest::proptest,
-    tokio::runtime::current_thread::Runtime,
+    tokio::runtime::Runtime,
 };
 
 use redis_cluster_async::{
@@ -48,51 +48,59 @@ impl RedisEnv {
     pub fn new() -> Self {
         let _ = env_logger::try_init();
 
-        let mut runtime = Runtime::new().unwrap();
+        let mut runtime = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
         let redis_lock = RedisProcess::lock();
 
         let redis_client = redis::Client::open(REDIS_URL)
             .unwrap_or_else(|_| panic!("Failed to connect to '{}'", REDIS_URL));
 
-        let node_infos = loop {
-            let node_infos = runtime
-                .block_on(async {
+        let (client, nodes) = runtime.block_on(async {
+            let node_infos = loop {
+                let node_infos = async {
                     let mut conn = redis_client.get_multiplexed_tokio_connection().await?;
                     Self::cluster_info(&mut conn).await
-                })
+                }
+                .await
                 .expect("Unable to query nodes for information");
-            // Wait for the cluster to stabilize
-            if node_infos.iter().filter(|(_, master)| *master).count() == 3 {
-                break node_infos;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        };
+                // Wait for the cluster to stabilize
+                if node_infos.iter().filter(|(_, master)| *master).count() == 3 {
+                    break node_infos;
+                }
+                tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
+            };
+            let mut node_urls = Vec::new();
+            let mut nodes = Vec::new();
+            // Clear databases:
+            for (url, master) in node_infos {
+                let redis_client = redis::Client::open(&url[..])
+                    .unwrap_or_else(|_| panic!("Failed to connect to '{}'", url));
+                let mut conn = redis_client
+                    .get_multiplexed_tokio_connection()
+                    .await
+                    .unwrap();
 
-        let mut node_urls = Vec::new();
-        let mut nodes = Vec::new();
-        // Clear databases:
-        for (url, master) in node_infos {
-            let mut redis_client = redis::Client::open(&url[..])
-                .unwrap_or_else(|_| panic!("Failed to connect to '{}'", url));
-
-            if master {
-                node_urls.push(url.to_string());
-                let () = redis::Cmd::new()
-                    .arg("FLUSHALL")
-                    .query(&mut redis_client)
+                if master {
+                    node_urls.push(url.to_string());
+                    let () = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        redis::Cmd::new().arg("FLUSHALL").query_async(&mut conn),
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err))
                     .unwrap_or_else(|err| panic!("Unable to flush {}: {}", url, err));
+                }
+
+                nodes.push(conn);
             }
 
-            nodes.push(
-                runtime
-                    .block_on(async { redis_client.get_multiplexed_tokio_connection().await })
-                    .unwrap(),
-            );
-        }
-
-        let client = runtime
-            .block_on(async { Client::open(node_urls.iter().map(|s| &s[..]).collect()) })
-            .unwrap();
+            let client = Client::open(node_urls.iter().map(|s| &s[..]).collect()).unwrap();
+            (client, nodes)
+        });
 
         RedisEnv {
             runtime,
@@ -113,16 +121,18 @@ impl RedisEnv {
                 s.lines()
                     .map(|line| {
                         let mut iter = line.split(' ');
+                        let port = iter
+                            .by_ref()
+                            .nth(1)
+                            .expect("Node ip")
+                            .splitn(2, '@')
+                            .next()
+                            .unwrap()
+                            .splitn(2, ':')
+                            .nth(1)
+                            .unwrap();
                         (
-                            format!(
-                                "redis://{}",
-                                iter.by_ref()
-                                    .nth(1)
-                                    .expect("Node ip")
-                                    .splitn(2, '@')
-                                    .next()
-                                    .unwrap()
-                            ),
+                            format!("redis://localhost:{}", port),
                             iter.next().expect("master").contains("master"),
                         )
                     })
@@ -176,6 +186,25 @@ fn basic_pipe() {
                 .query_async(&mut connection)
                 .await?;
             assert_eq!(res, "test_data3");
+            Ok(())
+        })
+        .map_err(|err: RedisError| err)
+        .unwrap()
+}
+
+#[test]
+fn xtrim_cmd() {
+    let mut env = RedisEnv::new();
+    let client = env.client;
+    env.runtime
+        .block_on(async {
+            let mut connection = client.get_connection().await?;
+            redis::cmd("XTRIM")
+                .arg("mystream")
+                .arg("MAXLEN")
+                .arg("~")
+                .query_async(&mut connection)
+                .await?;
             Ok(())
         })
         .map_err(|err: RedisError| err)

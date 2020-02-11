@@ -1,6 +1,6 @@
 [package]
 name = "redis_cluster_async"
-version = "0.1.0"
+version = "0.1.2-alpha.0"
 authors = ["Markus Westerlind <marwes91@gmail.com>"]
 keywords = ["redis", "cluster", "database", "async"]
 description = "Async redis cluster driver for Rust."
@@ -13,16 +13,15 @@ edition = "2018"
 
 [dependencies]
 crc16 = "0.4"
-futures = { version = "0.3.0-alpha.18", package = "futures-preview" }
+futures = "0.3"
 rand = "0.7"
 pin-project = "0.4"
-redis = { git = "https://github.com/dwerner/redis-rs", rev = "7cbf90ff5699fb951e20b75134fc1ac2eab9b0e4", features = ["tokio-executor"] }
-tokio-executor = "0.2.0-alpha.6"
-tokio-timer = "0.3.0-alpha.6"
+redis = { version = "0.14", features = ["tokio-rt-core"] }
+tokio = { version = "0.2", features = ["time"] }
 log = "0.4"
 
 [dev-dependencies]
 lazy_static = "1"
-tokio = "0.2.0-alpha.6"
-env_logger = "0.6"
+tokio = { version = "0.2", features = ["macros", "full"] }
+env_logger = "0.7"
 proptest = "0.9"

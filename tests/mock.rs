@@ -12,7 +12,7 @@ use {
         },
         Client, Connect,
     },
-    tokio::runtime::current_thread::Runtime,
+    tokio::runtime::Runtime,
 };
 
 type Handler = Arc<dyn Fn(&redis::Cmd, u16) -> Result<(), RedisResult<Value>> + Send + Sync>;
@@ -119,7 +119,12 @@ impl MockEnv {
         id: &str,
         handler: impl Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync + 'static,
     ) -> Self {
-        let mut runtime = Runtime::new().unwrap();
+        let mut runtime = tokio::runtime::Builder::new()
+            .basic_scheduler()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
 
         let id = id.to_string();
         HANDLERS.write().unwrap().insert(
