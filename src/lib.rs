@@ -30,7 +30,7 @@
 //!
 //! # Pipelining
 //! ```rust
-//! use redis_cluster_async::{Client, redis::{PipelineCommands, pipe}};
+//! use redis_cluster_async::{Client, redis::pipe};
 //!
 //! #[tokio::main]
 //! async fn main() -> redis::RedisResult<()> {
@@ -65,6 +65,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     time::Duration,
+    error::Error,
 };
 
 use crc16::*;
@@ -204,25 +205,29 @@ impl<C> CmdArg<C> {
     fn slot(&self) -> Option<u16> {
         fn slot_for_command(cmd: &Cmd) -> Option<u16> {
 
-            // TODO: more sophistocated command reflection...
-            // HACK: early recognition of STREAMS call
-            let streams_idx = cmd.args_iter()
-                .enumerate()
-                .find(|(_, arg)| match arg {
-                    redis::Arg::Simple(a) if String::from_utf8_lossy(a)
-                        .eq_ignore_ascii_case("STREAMS") => true,
-                    _ => false
-                }).map(|(i, _)| i);
-
-            if let Some(idx) = streams_idx {
-                if let Some(redis::Arg::Simple(key)) = cmd.args_iter().nth(idx + 1) {
-                    return Some(slot_for_key(key))
+            cmd.args_iter().nth(0).and_then(|arg| match arg {
+                // TODO: more sophistocated command reflection...
+                redis::Arg::Simple(a) if a.eq_ignore_ascii_case(b"XREAD") => {
+                    let streams_idx = cmd.args_iter()
+                        .enumerate()
+                        .find(|(_, arg)| match arg {
+                            // TODO: proper recognition of STREAMS call
+                            redis::Arg::Simple(a) if a.eq_ignore_ascii_case(b"STREAMS") => true,
+                            _ => false
+                        }).map(|(i, _)| i);
+                    if let Some(idx) = streams_idx {
+                        if let Some(redis::Arg::Simple(key)) = cmd.args_iter().nth(idx + 1) {
+                            // TODO: balancing for key [key] id [id] in https://redis.io/commands/xread
+                            return Some(slot_for_key(key))
+                        }
+                    }
+                    None
                 }
-            }
 
-            cmd.args_iter().nth(1).and_then(|arg| match arg {
-                redis::Arg::Simple(key) => Some(slot_for_key(key)),
-                redis::Arg::Cursor => None, // FIXME ???
+                _ => cmd.args_iter().nth(1).and_then(|arg| match arg {
+                    redis::Arg::Simple(key) => Some(slot_for_key(key)),
+                    redis::Arg::Cursor => None, // FIXME ???
+                })
             })
         }
         match self {
@@ -335,30 +340,42 @@ where
                 }
                 self.retry = self.retry.saturating_add(1);
 
+                fn parse_ask_or_moved(err_str: &str) -> Result<(u16, String), Box<dyn Error>> {
+                    let parts = err_str.split(' ').collect::<Vec<_>>();
+                    if parts.len() != 3 {
+                        return Err(format!("unexpected error message format '{}'", err_str).into());
+                    }
+                    let slot = parts[1].parse::<u16>()?;
+                    let addr = parts[2].to_string();
+                    Ok((slot, addr))
+                }
+
                 if let Some(error_code) = err.extension_error_code() {
-                    if  error_code == "MOVED" {
-                        let e = format!("{}", err);
-                        let parts = e.split(' ').collect::<Vec<_>>();
-                        debug_assert!(parts.len() == 3, "unexpected MOVED message format");
-                        return Ok(Next::Moved{
-                            slot: parts[1].parse::<u16>().expect("expected a u16"),
-                            addr: parts[2].to_string()
-                        }).into()
-                    } else if error_code == "ASK" {
-                        let e = format!("{}", err);
-                        let parts = e.split(' ').collect::<Vec<_>>();
-                        debug_assert!(parts.len() == 3, "unexpected ASK message format");
-                        return Ok(Next::Ask{
-                            slot: parts[1].parse::<u16>().expect("expected a u16"),
-                            addr: parts[2].to_string()
-                        }).into()
-                    } else if error_code == "TRYAGAIN" || error_code == "CLUSTERDOWN" {
-                        // Sleep and retry.
-                        let sleep_duration =
-                            Duration::from_millis(2u64.pow(self.retry.max(7).min(16)) * 10);
-                        self.info.excludes.clear();
-                        self.future = RequestState::Delay(tokio::time::delay_for(sleep_duration));
-                        return self.poll_request(cx, connections_len);
+                    match error_code {
+                        "MOVED" => match parse_ask_or_moved(&format!("{}", err)) {
+                            Ok((slot, parsed_addr)) => {
+                                self.info.excludes.insert(addr);
+                                return Ok(Next::Moved { slot, addr: parsed_addr }).into()
+                            }
+                            _ => {}
+                        }
+                        "ASK" => match parse_ask_or_moved(&format!("{}", err)) {
+                            Ok((slot, parsed_addr)) => {
+                                self.info.excludes.insert(addr);
+                                return Ok(Next::Ask { slot, addr: parsed_addr }).into()
+                            }
+                            _ => {}
+                        }
+                        "TRYAGAIN" | "CLUSTERDOWN" => {
+                            // Sleep and retry.
+                            let sleep_duration =
+                                Duration::from_millis(2u64.pow(self.retry.max(7).min(16)) * 10);
+                            self.info.excludes.clear();
+                            self.future = RequestState::Delay(tokio::time::delay_for(sleep_duration));
+                            return self.poll_request(cx, connections_len);
+                        }
+
+                        _ => {}
                     }
                 }
 
@@ -420,11 +437,9 @@ where
             })
             .fold(
                 HashMap::with_capacity(initial_nodes.len()),
-                |mut connections: HashMap<String, C>, conn: Option<(String, C)>| {
-                    async move {
-                        connections.extend(conn);
-                        connections
-                    }
+                |mut connections: HashMap<String, C>, conn: Option<(String, C)>| async move {
+                    connections.extend(conn);
+                    connections
                 },
             )
             .map(|connections| {
@@ -467,29 +482,25 @@ where
             let (_, connections) = stream::iter(slots.values())
                 .fold(
                     (connections, new_connections),
-                    move |(mut connections, mut new_connections), addr| {
-                        async move {
-                            if !new_connections.contains_key(addr) {
-                                let new_connection = if let Some(mut conn) =
-                                    connections.remove(addr)
-                                {
-                                    match check_connection(&mut conn).await {
-                                        Ok(_) => Some((addr.to_string(), conn)),
-                                        Err(_) => match connect_and_check(addr.as_ref()).await {
-                                            Ok(conn) => Some((addr.to_string(), conn)),
-                                            Err(_) => None,
-                                        },
-                                    }
-                                } else {
-                                    match connect_and_check(addr.as_ref()).await {
+                    move |(mut connections, mut new_connections), addr| async move {
+                        if !new_connections.contains_key(addr) {
+                            let new_connection = if let Some(mut conn) = connections.remove(addr) {
+                                match check_connection(&mut conn).await {
+                                    Ok(_) => Some((addr.to_string(), conn)),
+                                    Err(_) => match connect_and_check(addr.as_ref()).await {
                                         Ok(conn) => Some((addr.to_string(), conn)),
                                         Err(_) => None,
-                                    }
-                                };
-                                new_connections.extend(new_connection);
-                            }
-                            (connections, new_connections)
+                                    },
+                                }
+                            } else {
+                                match connect_and_check(addr.as_ref()).await {
+                                    Ok(conn) => Some((addr.to_string(), conn)),
+                                    Err(_) => None,
+                                }
+                            };
+                            new_connections.extend(new_connection);
                         }
+                        (connections, new_connections)
                     },
                 )
                 .await;
@@ -846,11 +857,9 @@ where
     T: IntoConnectionInfo + Send + 'a,
     C: ConnectionLike + Connect + Send + 'static,
 {
-    C::connect(info).and_then(|mut conn| {
-        async move {
-            check_connection(&mut conn).await?;
-            Ok(conn)
-        }
+    C::connect(info).and_then(|mut conn| async move {
+        check_connection(&mut conn).await?;
+        Ok(conn)
     })
 }
 

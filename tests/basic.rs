@@ -193,16 +193,42 @@ fn basic_pipe() {
 }
 
 #[test]
-fn xtrim_cmd() {
+fn xadd_cmd() {
     let mut env = RedisEnv::new();
     let client = env.client;
     env.runtime
         .block_on(async {
             let mut connection = client.get_connection().await?;
-            redis::cmd("XTRIM")
+            redis::cmd("XADD")
                 .arg("mystream")
                 .arg("MAXLEN")
-                .arg("~")
+                .arg("10")
+                .arg("*")
+                .arg("field1")
+                .arg("value1")
+                .arg("field2")
+                .arg("value2")
+                .query_async(&mut connection)
+                .await?;
+            Ok(())
+        })
+        .map_err(|err: RedisError| err)
+        .unwrap()
+}
+
+#[test]
+fn xread_streams_cmd() {
+    let mut env = RedisEnv::new();
+    let client = env.client;
+    env.runtime
+        .block_on(async {
+            let mut connection = client.get_connection().await?;
+            redis::cmd("XREAD")
+                .arg("COUNT")
+                .arg(10)
+                .arg("STREAMS")
+                .arg("mystream")
+                .arg("0-0")
                 .query_async(&mut connection)
                 .await?;
             Ok(())
