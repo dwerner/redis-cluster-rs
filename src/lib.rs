@@ -302,6 +302,16 @@ enum Next {
     Done,
 }
 
+fn parse_ask_or_moved(err_str: &str) -> Result<(u16, String), Box<dyn Error>> {
+    let parts = err_str.split(' ').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(format!("unexpected error message format '{}'", err_str).into());
+    }
+    let slot = parts[1].parse::<u16>()?;
+    let addr = parts[2].to_string();
+    Ok((slot, addr))
+}
+
 impl<F, I, C> Request<F, I, C>
 where
     F: Future<Output = (String, RedisResult<I>)> + Unpin,
@@ -340,17 +350,7 @@ where
                 }
                 self.retry = self.retry.saturating_add(1);
 
-                fn parse_ask_or_moved(err_str: &str) -> Result<(u16, String), Box<dyn Error>> {
-                    let parts = err_str.split(' ').collect::<Vec<_>>();
-                    if parts.len() != 3 {
-                        return Err(format!("unexpected error message format '{}'", err_str).into());
-                    }
-                    let slot = parts[1].parse::<u16>()?;
-                    let addr = parts[2].to_string();
-                    Ok((slot, addr))
-                }
-
-                if let Some(error_code) = err.extension_error_code() {
+                if let Some(error_code) = err.code() {
                     match error_code {
                         "MOVED" => match parse_ask_or_moved(&format!("{}", err)) {
                             Ok((slot, parsed_addr)) => {
@@ -427,7 +427,7 @@ where
             .then(|info| {
                 let addr = match *info.addr {
                     ConnectionAddr::Tcp(ref host, port) => format!("redis://{}:{}", host, port),
-                    _ => panic!("No reach."),
+                    _ => panic!("Unable to reach host {:?}", info),
                 };
 
                 connect_and_check(info.clone()).map(|result| match result {
@@ -446,7 +446,7 @@ where
                 if connections.is_empty() {
                     return Err(RedisError::from((
                         ErrorKind::IoError,
-                        "Failed to create initial connections",
+                        "Failed to create any initial connections",
                     )));
                 }
                 Ok(connections)
@@ -594,6 +594,7 @@ where
     type Error = ();
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
+        trace!("Pipeline::poll_ready");
         Ok(()).into()
     }
 
@@ -639,7 +640,8 @@ where
                         trace!("Recover not ready");
                         return Poll::Pending;
                     }
-                    Poll::Ready(Err(_err)) => {
+                    Poll::Ready(Err(err)) => {
+                        log::trace!("error trying to recover {:?}", err);
                         ConnectionState::Recover(Box::pin(self.refresh_slots()))
                     }
                 },
@@ -696,6 +698,7 @@ where
                                     }
                                 },
                                 Err(err) => {
+                                    log::trace!("error {:?}", err);
                                     error = Some(err);
 
                                     self.in_flight_requests[i].future = RequestState::None;
