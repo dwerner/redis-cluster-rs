@@ -203,16 +203,39 @@ impl<C> CmdArg<C> {
     }
 
     fn slot(&self) -> Option<u16> {
+        fn get_cmd_arg(cmd: &Cmd, arg_num: usize) -> Option<&[u8]> {
+            cmd.args_iter().nth(arg_num).and_then(|arg| match arg {
+                redis::Arg::Simple(arg) => Some(arg),
+                redis::Arg::Cursor => None,
+            })
+        }
         fn slot_for_command(cmd: &Cmd) -> Option<u16> {
-
-            cmd.args_iter().nth(0).and_then(|arg| match arg {
-                // TODO: more sophistocated command reflection...
-                redis::Arg::Simple(a) if a.eq_ignore_ascii_case(b"XREAD") => {
+            match get_cmd_arg(cmd, 0) {
+                Some(b"EVAL") | Some(b"EVALSHA") => {
+                    get_cmd_arg(cmd, 2).and_then(|key_count_bytes| {
+                        let key_count_res = std::str::from_utf8(key_count_bytes)
+                            .ok()
+                            .and_then(|key_count_str| key_count_str.parse::<usize>().ok());
+                        key_count_res.and_then(|key_count| {
+                            if key_count > 0 {
+                                get_cmd_arg(cmd, 3).map(|key| slot_for_key(key))
+                            } else {
+                                // TODO need to handle sending to all masters
+                                None
+                            }
+                        })
+                    })
+                }
+                Some(b"SCRIPT") => {
+                    // TODO need to handle sending to all masters
+                    None
+                }
+                Some(b"XREAD") => {
                     let streams_idx = cmd.args_iter()
                         .enumerate()
                         .find(|(_, arg)| match arg {
                             // TODO: proper recognition of STREAMS call
-                            redis::Arg::Simple(a) if a.eq_ignore_ascii_case(b"STREAMS") => true,
+                            redis::Arg::Simple(b"STREAMS") => true,
                             _ => false
                         }).map(|(i, _)| i);
                     if let Some(idx) = streams_idx {
@@ -223,12 +246,8 @@ impl<C> CmdArg<C> {
                     }
                     None
                 }
-
-                _ => cmd.args_iter().nth(1).and_then(|arg| match arg {
-                    redis::Arg::Simple(key) => Some(slot_for_key(key)),
-                    redis::Arg::Cursor => None, // FIXME ???
-                })
-            })
+                _ => get_cmd_arg(cmd, 1).map(|key| slot_for_key(key)),
+            }
         }
         match self {
             Self::Cmd { cmd, .. } => slot_for_command(cmd),
@@ -352,19 +371,17 @@ where
 
                 if let Some(error_code) = err.code() {
                     match error_code {
-                        "MOVED" => match parse_ask_or_moved(&format!("{}", err)) {
-                            Ok((slot, parsed_addr)) => {
+                        "MOVED" => {
+                            if let Ok((slot, parsed_addr)) = parse_ask_or_moved(&format!("{}", err)) {
                                 self.info.excludes.insert(addr);
                                 return Ok(Next::Moved { slot, addr: parsed_addr }).into()
                             }
-                            _ => {}
                         }
-                        "ASK" => match parse_ask_or_moved(&format!("{}", err)) {
-                            Ok((slot, parsed_addr)) => {
+                        "ASK" => {
+                            if let Ok((slot, parsed_addr)) = parse_ask_or_moved(&format!("{}", err)) {
                                 self.info.excludes.insert(addr);
                                 return Ok(Next::Ask { slot, addr: parsed_addr }).into()
                             }
-                            _ => {}
                         }
                         "TRYAGAIN" | "CLUSTERDOWN" => {
                             // Sleep and retry.
@@ -458,7 +475,7 @@ where
     fn refresh_slots(
         &mut self,
     ) -> impl Future<Output = RedisResult<(SlotMap, HashMap<String, C>)>> {
-        let mut connections = mem::replace(&mut self.connections, Default::default());
+        let mut connections = mem::take(&mut self.connections);
 
         async move {
             let mut result = Ok(SlotMap::new());
